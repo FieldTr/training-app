@@ -1451,14 +1451,6 @@
 // ===========================
 const GS_URL = "https://script.google.com/macros/s/AKfycbz_OX6LZBjwXSS_xHT5FEWrweHWYYPzC_ZF-RRSSsS8Dzv5bq5GCdAXV3xMEYzFSD8R/exec";
 
-// In-memory cache
-const cache = {
-  students: [], schools: [], supervisors: [],
-  attendance: [], departments: [],
-  creds: { username: 'admin', password: 'port2024' },
-  trainingSettings: {}
-};
-
 // Column headers per sheet
 const HEADERS = {
   students:    ['id','name','seatNo','natId','dept','year','school','supervisor','phone','parentPhone'],
@@ -1468,178 +1460,132 @@ const HEADERS = {
   departments: ['id','name'],
 };
 
-// ── Helper: fetch with mobile-safe CORS handling ──
-async function gsFetch(url, options={}) {
+// ── Core API call — POST with text/plain bypasses CORS preflight ──
+async function apiCall(payload) {
   try {
-    // Try direct fetch first
-    const res = await fetch(url, { redirect: 'follow', ...options });
+    const res = await fetch(GS_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: JSON.stringify(payload),
+      redirect: 'follow'
+    });
     const text = await res.text();
-    try { return JSON.parse(text); }
-    catch(e) {
-      // Try to extract JSON from response
-      const match = text.match(/\{.*\}/s);
-      if (match) return JSON.parse(match[0]);
-      console.error('gsFetch parse error:', text.slice(0,200));
+    try { return JSON.parse(text); } catch(e) {
+      // Apps Script sometimes wraps in extra chars
+      const m = text.match(/\{[\s\S]*\}/);
+      if (m) return JSON.parse(m[0]);
+      console.error('API parse error:', text.slice(0,300));
       return null;
     }
   } catch(e) {
-    // On mobile, try with no-cors via image trick for writes,
-    // and fall back to cache for reads
-    console.warn('gsFetch network error:', e.message);
+    console.error('API call failed:', e.message);
     return null;
   }
 }
 
-// ── JSONP fetch for mobile compatibility ──
-function gsFetchJsonp(url) {
-  return new Promise((resolve, reject) => {
-    const cbName = 'gs_cb_' + Date.now();
-    const script = document.createElement('script');
-    const timeout = setTimeout(() => {
-      delete window[cbName];
-      script.remove();
-      reject(new Error('JSONP timeout'));
-    }, 8000);
-    window[cbName] = (data) => {
-      clearTimeout(timeout);
-      delete window[cbName];
-      script.remove();
-      resolve(data);
-    };
-    script.src = url + '&callback=' + cbName;
-    script.onerror = () => { clearTimeout(timeout); reject(new Error('JSONP error')); };
-    document.head.appendChild(script);
-  });
+// ── Parse sheet rows → array of objects ──
+function parseRows(data, sheetName) {
+  if (!data || data.length < 2) return [];
+  const headers = data[0];
+  return data.slice(1).map(row => {
+    const obj = {};
+    headers.forEach((h, i) => {
+      let val = row[i] ?? '';
+      if (typeof val === 'string' && val !== '' && (val[0] === '[' || val[0] === '{')) {
+        try { val = JSON.parse(val); } catch(e) {}
+      }
+      if ((h === 'id' || h === 'studentId') && val !== '') val = Number(val);
+      obj[h] = val;
+    });
+    return obj;
+  }).filter(o => o.id !== '' && o.id !== undefined && o.id !== 0);
 }
 
-// ── Read a sheet → array of objects ──
+// ── Read sheet ──
 async function gsRead(sheet) {
-  const cacheKey = 'gs_cache_' + sheet;
-
-  function parseSheetData(json) {
-    if (!json || !json.data || json.data.length < 2) return null;
-    const headers = json.data[0];
-    const result = json.data.slice(1).map(row => {
-      const obj = {};
-      headers.forEach((h, i) => {
-        let val = row[i] ?? '';
-        if (typeof val === 'string' && (val.startsWith('[') || val.startsWith('{'))) {
-          try { val = JSON.parse(val); } catch(e) {}
-        }
-        if ((h === 'id' || h === 'studentId') && val !== '') val = Number(val);
-        obj[h] = val;
-      });
-      return obj;
-    }).filter(o => o.id !== '' && o.id !== undefined);
-    localStorage.setItem(cacheKey, JSON.stringify(result));
-    return result;
-  }
-
-  // Try regular fetch
+  const cacheKey = 'gs_' + sheet;
   try {
-    const url = GS_URL + '?action=read&sheet=' + encodeURIComponent(sheet);
-    const json = await gsFetch(url);
-    const result = parseSheetData(json);
-    if (result) return result;
-  } catch(e) {
-    console.warn('gsRead fetch failed, trying JSONP:', sheet);
-  }
-
-  // Try JSONP (better mobile support)
-  try {
-    const url = GS_URL + '?action=read&sheet=' + encodeURIComponent(sheet);
-    const json = await gsFetchJsonp(url);
-    const result = parseSheetData(json);
-    if (result) return result;
-  } catch(e) {
-    console.warn('gsRead JSONP failed:', sheet, e.message);
-  }
-
-  // Fall back to localStorage
+    const res = await apiCall({ action: 'read', sheet });
+    if (res && res.data && res.data.length >= 2) {
+      const result = parseRows(res.data, sheet);
+      localStorage.setItem(cacheKey, JSON.stringify(result));
+      return result;
+    }
+  } catch(e) { console.error('gsRead failed:', sheet, e); }
+  // Fallback to localStorage
   const cached = localStorage.getItem(cacheKey);
   return cached ? JSON.parse(cached) : [];
 }
 
-// ── Write full array to a sheet ──
+// ── Write sheet ──
 async function gsWrite(sheet, arr) {
-  // Always save to localStorage first (instant + offline backup)
-  localStorage.setItem('gs_cache_' + sheet, JSON.stringify(arr));
-
+  // Save locally immediately
+  localStorage.setItem('gs_' + sheet, JSON.stringify(arr));
   const headers = HEADERS[sheet];
-  const rows = [headers, ...arr.map(obj =>
-    headers.map(h => {
+  if (!headers) return;
+  const rows = [
+    headers,
+    ...arr.map(obj => headers.map(h => {
       const v = obj[h] ?? '';
       return Array.isArray(v) ? JSON.stringify(v) : v;
-    })
-  )];
-  const payload = encodeURIComponent(JSON.stringify(rows));
-  const url = GS_URL + '?action=write&sheet=' + encodeURIComponent(sheet) + '&rows=' + payload;
-
-  // Try regular fetch
+    }))
+  ];
   try {
-    const json = await gsFetch(url);
-    if (json && json.ok) return json;
-  } catch(e) {
-    console.warn('gsWrite fetch failed, trying JSONP:', sheet);
-  }
-
-  // Try JSONP
-  try {
-    const json = await gsFetchJsonp(url);
-    return json;
-  } catch(e) {
-    console.warn('gsWrite JSONP failed (data saved locally):', sheet);
-  }
+    const res = await apiCall({ action: 'write', sheet, rows });
+    if (!res || !res.ok) console.warn('gsWrite response:', res);
+    return res;
+  } catch(e) { console.error('gsWrite failed:', sheet, e); }
 }
 
-// ── Read settings (key-value sheet) ──
-async function gsReadSettings(sheet) {
+// ── Read settings (key→value) ──
+async function gsReadSettings() {
   try {
-    const url = GS_URL + '?action=read&sheet=' + encodeURIComponent(sheet);
-    const json = await gsFetch(url);
-    if (!json || !json.data || json.data.length < 1) {
-      const cached = localStorage.getItem('gs_cache_' + sheet);
-      return cached ? JSON.parse(cached) : {};
+    const res = await apiCall({ action: 'read', sheet: 'settings' });
+    if (res && res.data) {
+      const obj = {};
+      res.data.forEach(row => { if (row[0]) obj[row[0]] = row[1]; });
+      localStorage.setItem('gs_settings', JSON.stringify(obj));
+      return obj;
     }
-    const obj = {};
-    json.data.forEach(row => { if(row[0]) obj[row[0]] = row[1]; });
-    localStorage.setItem('gs_cache_' + sheet, JSON.stringify(obj));
-    return obj;
-  } catch(e) {
-    const cached = localStorage.getItem('gs_cache_' + sheet);
-    return cached ? JSON.parse(cached) : {};
-  }
+  } catch(e) { console.error('gsReadSettings failed:', e); }
+  const cached = localStorage.getItem('gs_settings');
+  return cached ? JSON.parse(cached) : {};
 }
 
-async function gsWriteSettings(sheet, obj) {
-  localStorage.setItem('gs_cache_' + sheet, JSON.stringify(obj));
+async function gsWriteSettings(obj) {
+  localStorage.setItem('gs_settings', JSON.stringify(obj));
+  const rows = Object.entries(obj).map(([k, v]) => [k, typeof v === 'object' ? JSON.stringify(v) : v]);
   try {
-    const rows = Object.entries(obj).map(([k,v]) => [k, typeof v === 'object' ? JSON.stringify(v) : v]);
-    const payload = encodeURIComponent(JSON.stringify(rows));
-    const url = GS_URL + '?action=write&sheet=' + encodeURIComponent(sheet) + '&rows=' + payload;
-    await gsFetch(url);
-  } catch(e) { console.error('gsWriteSettings error:', e); }
+    await apiCall({ action: 'write', sheet: 'settings', rows });
+  } catch(e) { console.error('gsWriteSettings failed:', e); }
 }
 
 // ===========================
-// DB OBJECT (cache-first, async writes)
+// DB OBJECT
 // ===========================
+const cache = {
+  students: [], schools: [], supervisors: [],
+  attendance: [], departments: [],
+  creds: { username: 'admin', password: 'port2024' },
+  trainingSettings: {}
+};
+
 const DB = {
   get:    k => cache[k] || [],
   getObj: k => cache[k] || {},
 
-  // Write full array to cache + Sheets
   set: async (k, arr) => {
     cache[k] = arr;
-    if (HEADERS[k]) await gsWrite(k, arr);
+    await gsWrite(k, arr);
   },
 
   setObj: async (k, obj) => {
     cache[k] = obj;
-    await gsWriteSettings(k, obj);
+    const current = await gsReadSettings();
+    current[k] = JSON.stringify(obj);
+    await gsWriteSettings(current);
   },
 
-  // Efficient single-item ops
   addItem: async (col, item) => {
     cache[col] = [...(cache[col] || []), item];
     await gsWrite(col, cache[col]);
@@ -1700,11 +1646,11 @@ async function loadAllData() {
     }
 
     // Settings
-    const settingsRaw = await gsReadSettings('settings');
+    const settingsRaw = await gsReadSettings();
     if (settingsRaw.creds) {
       try { cache.creds = JSON.parse(settingsRaw.creds); } catch(e) {}
     } else {
-      await gsWriteSettings('settings', { creds: JSON.stringify(cache.creds) });
+      await gsWriteSettings({ creds: JSON.stringify(cache.creds) });
     }
     if (settingsRaw.trainingSettings) {
       try { cache.trainingSettings = JSON.parse(settingsRaw.trainingSettings); } catch(e) {}
@@ -2413,9 +2359,9 @@ async function changeCredentials(){
   if(p!==c){toast('كلمة المرور غير متطابقة','error');return;}
   showSaving();
   cache.creds={username:u,password:p};
-  const settingsRaw=await gsReadSettings('settings');
+  const settingsRaw=await gsReadSettings();
   settingsRaw.creds=JSON.stringify(cache.creds);
-  await gsWriteSettings('settings',settingsRaw);
+  await gsWriteSettings(settingsRaw);
   document.getElementById('sidebarUsername').textContent=u;
   ['newUsername','newPassword','confirmPassword'].forEach(id=>document.getElementById(id).value='');
   hideSaving(); toast('✅ تم تغيير بيانات الدخول بنجاح');
@@ -2429,9 +2375,9 @@ async function saveTrainingSettings(){
   };
   showSaving();
   cache.trainingSettings=settings;
-  const settingsRaw=await gsReadSettings('settings');
+  const settingsRaw=await gsReadSettings();
   settingsRaw.trainingSettings=JSON.stringify(settings);
-  await gsWriteSettings('settings',settingsRaw);
+  await gsWriteSettings(settingsRaw);
   hideSaving(); toast('✅ تم حفظ إعدادات التدريب');
 }
 
