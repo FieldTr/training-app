@@ -784,19 +784,55 @@
   }
 
   /* RESPONSIVE */
+  /* ── HAMBURGER BUTTON ── */
+  .hamburger {
+    display: none;
+    background: none; border: none; cursor: pointer;
+    flex-direction: column; gap: 5px; padding: 4px;
+  }
+  .hamburger span {
+    display: block; width: 24px; height: 2.5px;
+    background: var(--primary); border-radius: 2px; transition: all .3s;
+  }
+
+  /* ── SIDEBAR OVERLAY ── */
+  .sidebar-overlay {
+    display: none; position: fixed; inset: 0;
+    background: rgba(0,0,0,0.5); z-index: 99;
+  }
+  .sidebar-overlay.show { display: block; }
+
   @media (max-width: 900px) {
     .stats-grid { grid-template-columns: 1fr 1fr; }
-    .sidebar { transform: translateX(260px); }
+    .sidebar {
+      transform: translateX(270px);
+      transition: transform 0.3s ease;
+      z-index: 200;
+    }
     .sidebar.open { transform: translateX(0); }
     .main-content { margin-right: 0; }
+    .topbar { padding: 12px 16px; }
+    .topbar-date { font-size:11px; }
+    .hamburger { display: flex; display: flex; }
+    .topbar { padding: 12px 16px; }
+    .topbar-date { display: none; }
   }
 
   @media (max-width: 600px) {
     .stats-grid { grid-template-columns: 1fr 1fr; gap: 10px; }
+    .stat-card { padding: 14px; }
+    .stat-value { font-size: 28px; }
     .form-grid, .form-grid-3 { grid-template-columns: 1fr; }
     .col-span-2, .col-span-3 { grid-column: span 1; }
-    .content-area { padding: 16px; }
+    .content-area { padding: 12px; }
     .attendance-grid { grid-template-columns: 1fr; }
+    .card { border-radius: 12px; }
+    .card-body { padding: 14px; }
+    .table-wrapper { overflow-x: auto; }
+    table { min-width: 500px; }
+    .modal { width: 96vw; max-height: 90vh; overflow-y: auto; }
+    .btn { font-size: 13px; padding: 8px 14px; }
+    #installBanner { padding: 12px 14px; }
   }
 
   .empty-state {
@@ -936,10 +972,18 @@
     </div>
   </aside>
 
+  <!-- Sidebar overlay for mobile -->
+  <div class="sidebar-overlay" id="sidebarOverlay" onclick="closeSidebar()"></div>
+
   <!-- MAIN CONTENT -->
   <main class="main-content">
     <div class="topbar">
-      <div class="topbar-title" id="pageTitle">لوحة التحكم</div>
+      <div style="display:flex;align-items:center;gap:12px;">
+        <button class="hamburger" id="hamburgerBtn" onclick="toggleSidebar()" aria-label="القائمة">
+          <span></span><span></span><span></span>
+        </button>
+        <div class="topbar-title" id="pageTitle">لوحة التحكم</div>
+      </div>
       <div class="topbar-date" id="todayDate"></div>
     </div>
 
@@ -1424,26 +1468,56 @@ const HEADERS = {
   departments: ['id','name'],
 };
 
-// ── Helper: fetch with redirect follow ──
+// ── Helper: fetch with mobile-safe CORS handling ──
 async function gsFetch(url, options={}) {
-  const res = await fetch(url, { redirect: 'follow', ...options });
-  const text = await res.text();
-  try { return JSON.parse(text); }
-  catch(e) { console.error('gsFetch parse error:', text.slice(0,200)); return null; }
+  try {
+    // Try direct fetch first
+    const res = await fetch(url, { redirect: 'follow', ...options });
+    const text = await res.text();
+    try { return JSON.parse(text); }
+    catch(e) {
+      // Try to extract JSON from response
+      const match = text.match(/\{.*\}/s);
+      if (match) return JSON.parse(match[0]);
+      console.error('gsFetch parse error:', text.slice(0,200));
+      return null;
+    }
+  } catch(e) {
+    // On mobile, try with no-cors via image trick for writes,
+    // and fall back to cache for reads
+    console.warn('gsFetch network error:', e.message);
+    return null;
+  }
+}
+
+// ── JSONP fetch for mobile compatibility ──
+function gsFetchJsonp(url) {
+  return new Promise((resolve, reject) => {
+    const cbName = 'gs_cb_' + Date.now();
+    const script = document.createElement('script');
+    const timeout = setTimeout(() => {
+      delete window[cbName];
+      script.remove();
+      reject(new Error('JSONP timeout'));
+    }, 8000);
+    window[cbName] = (data) => {
+      clearTimeout(timeout);
+      delete window[cbName];
+      script.remove();
+      resolve(data);
+    };
+    script.src = url + '&callback=' + cbName;
+    script.onerror = () => { clearTimeout(timeout); reject(new Error('JSONP error')); };
+    document.head.appendChild(script);
+  });
 }
 
 // ── Read a sheet → array of objects ──
 async function gsRead(sheet) {
-  // Try localStorage cache first (for speed)
   const cacheKey = 'gs_cache_' + sheet;
-  try {
-    const url = GS_URL + '?action=read&sheet=' + encodeURIComponent(sheet);
-    const json = await gsFetch(url);
-    if (!json || !json.data || json.data.length < 2) {
-      // Fall back to localStorage
-      const cached = localStorage.getItem(cacheKey);
-      return cached ? JSON.parse(cached) : [];
-    }
+
+  function parseSheetData(json) {
+    if (!json || !json.data || json.data.length < 2) return null;
     const headers = json.data[0];
     const result = json.data.slice(1).map(row => {
       const obj = {};
@@ -1457,35 +1531,64 @@ async function gsRead(sheet) {
       });
       return obj;
     }).filter(o => o.id !== '' && o.id !== undefined);
-    // Save to localStorage as backup
     localStorage.setItem(cacheKey, JSON.stringify(result));
     return result;
-  } catch(e) {
-    console.error('gsRead error:', sheet, e);
-    // Fall back to localStorage
-    const cached = localStorage.getItem('gs_cache_' + sheet);
-    return cached ? JSON.parse(cached) : [];
   }
+
+  // Try regular fetch
+  try {
+    const url = GS_URL + '?action=read&sheet=' + encodeURIComponent(sheet);
+    const json = await gsFetch(url);
+    const result = parseSheetData(json);
+    if (result) return result;
+  } catch(e) {
+    console.warn('gsRead fetch failed, trying JSONP:', sheet);
+  }
+
+  // Try JSONP (better mobile support)
+  try {
+    const url = GS_URL + '?action=read&sheet=' + encodeURIComponent(sheet);
+    const json = await gsFetchJsonp(url);
+    const result = parseSheetData(json);
+    if (result) return result;
+  } catch(e) {
+    console.warn('gsRead JSONP failed:', sheet, e.message);
+  }
+
+  // Fall back to localStorage
+  const cached = localStorage.getItem(cacheKey);
+  return cached ? JSON.parse(cached) : [];
 }
 
 // ── Write full array to a sheet ──
 async function gsWrite(sheet, arr) {
-  // Save to localStorage immediately (instant backup)
+  // Always save to localStorage first (instant + offline backup)
   localStorage.setItem('gs_cache_' + sheet, JSON.stringify(arr));
+
+  const headers = HEADERS[sheet];
+  const rows = [headers, ...arr.map(obj =>
+    headers.map(h => {
+      const v = obj[h] ?? '';
+      return Array.isArray(v) ? JSON.stringify(v) : v;
+    })
+  )];
+  const payload = encodeURIComponent(JSON.stringify(rows));
+  const url = GS_URL + '?action=write&sheet=' + encodeURIComponent(sheet) + '&rows=' + payload;
+
+  // Try regular fetch
   try {
-    const headers = HEADERS[sheet];
-    const rows = [headers, ...arr.map(obj =>
-      headers.map(h => {
-        const v = obj[h] ?? '';
-        return Array.isArray(v) ? JSON.stringify(v) : v;
-      })
-    )];
-    const payload = encodeURIComponent(JSON.stringify(rows));
-    const url = GS_URL + '?action=write&sheet=' + encodeURIComponent(sheet) + '&rows=' + payload;
     const json = await gsFetch(url);
+    if (json && json.ok) return json;
+  } catch(e) {
+    console.warn('gsWrite fetch failed, trying JSONP:', sheet);
+  }
+
+  // Try JSONP
+  try {
+    const json = await gsFetchJsonp(url);
     return json;
   } catch(e) {
-    console.error('gsWrite error:', sheet, e);
+    console.warn('gsWrite JSONP failed (data saved locally):', sheet);
   }
 }
 
@@ -2427,6 +2530,24 @@ function toast(msg,type='success'){
 // BOOT
 // ===========================
 loadAllData().then(()=>{ console.log('✅ App ready — Google Sheets backend'); });
+
+// ── SIDEBAR TOGGLE (mobile) ──
+function toggleSidebar() {
+  const sidebar = document.querySelector('.sidebar');
+  const overlay = document.getElementById('sidebarOverlay');
+  sidebar.classList.toggle('open');
+  overlay.classList.toggle('show');
+}
+function closeSidebar() {
+  document.querySelector('.sidebar').classList.remove('open');
+  document.getElementById('sidebarOverlay').classList.remove('show');
+}
+// Close sidebar when nav item clicked on mobile
+document.querySelectorAll('.nav-item').forEach(item => {
+  item.addEventListener('click', () => {
+    if (window.innerWidth <= 900) closeSidebar();
+  });
+});
 
 // ===========================
 // PWA — Service Worker + Install Prompt
